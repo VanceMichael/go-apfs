@@ -9,6 +9,7 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -91,12 +92,6 @@ func DecryptDMGWithPassword(path string, password string) (string, error) {
 			hdr.BlobEncAlgorithm, hdr.BlobEncMode, hdr.BlobEncPadding)
 	}
 
-	tmp, err := os.CreateTemp("", "dmg")
-	if err != nil {
-		return "", fmt.Errorf("failed to create temp DMG file: %w", err)
-	}
-	defer tmp.Close()
-
 	if hdr.KdfAlgorithm != 103 || hdr.KdfPrngAlgorithm != 0 || hdr.KdfSaltLen != 20 {
 		return "", fmt.Errorf("unsupported key derivation algorithm: %d, prng algorithm: %d, salt length: %d",
 			hdr.KdfAlgorithm, hdr.KdfPrngAlgorithm, hdr.KdfSaltLen)
@@ -111,7 +106,6 @@ func DecryptDMGWithPassword(path string, password string) (string, error) {
 	// Decrypt the keyblob using Triple DES (DES_EDE3_CBC).
 	tdes, err := des.NewTripleDESCipher(dk)
 	if err != nil {
-		tmp.Close()
 		return "", fmt.Errorf("failed to create 3DES cipher: %v", err)
 	}
 
@@ -120,7 +114,6 @@ func DecryptDMGWithPassword(path string, password string) (string, error) {
 	keyblob = keyblob[:hdr.EncryptedKeyblobSize]
 
 	if len(keyblob)%tdes.BlockSize() != 0 {
-		tmp.Close()
 		return "", fmt.Errorf("invalid keyblob size, not a multiple of block size")
 	}
 
@@ -220,7 +213,21 @@ func decryptDMGWithKeys(path string, aesKey []byte, hmacKey []byte) (string, err
 	if err != nil {
 		return "", fmt.Errorf("failed to create temp DMG file: %w", err)
 	}
-	defer tmp.Close()
+	tmpPath := tmp.Name()
+	// rollback closes and removes the incomplete plaintext image so a failed
+	// decryption never leaves decrypted bytes or the temp path behind. The
+	// caller's original error stays first so errors.Is/errors.As and the
+	// diagnostic message keep pointing at the decryption failure.
+	rollback := func(cause error) (string, error) {
+		var cleanup []error
+		if err := tmp.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			cleanup = append(cleanup, fmt.Errorf("failed to close temp DMG file: %w", err))
+		}
+		if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
+			cleanup = append(cleanup, fmt.Errorf("failed to remove temp DMG file %s: %w", tmpPath, err))
+		}
+		return "", errors.Join(append([]error{cause}, cleanup...)...)
+	}
 
 	// Create block cipher based on AES key size
 	var blk cipher.Block
@@ -228,14 +235,14 @@ func decryptDMGWithKeys(path string, aesKey []byte, hmacKey []byte) (string, err
 	case 128, 256:
 		blk, err = aes.NewCipher(aesKey)
 		if err != nil {
-			return "", fmt.Errorf("failed to create AES %d-bit cipher: %w", hdr.DataEncKeyBits, err)
+			return rollback(fmt.Errorf("failed to create AES %d-bit cipher: %w", hdr.DataEncKeyBits, err))
 		}
 	default:
-		return "", fmt.Errorf("unsupported AES key size %d", hdr.DataEncKeyBits)
+		return rollback(fmt.Errorf("unsupported AES key size %d", hdr.DataEncKeyBits))
 	}
 
 	if _, err := f.Seek(int64(hdr.Dataoffset), io.SeekStart); err != nil {
-		return "", fmt.Errorf("failed to seek to data offset: %w", err)
+		return rollback(fmt.Errorf("failed to seek to data offset: %w", err))
 	}
 
 	buf := make([]byte, hdr.Blocksize)
@@ -250,22 +257,27 @@ func decryptDMGWithKeys(path string, aesKey []byte, hmacKey []byte) (string, err
 			binary.BigEndian.PutUint32(ivbuf[:], uint32(i))
 			mac := hmac.New(sha1.New, hmacKey)
 			if _, err := mac.Write(ivbuf[:]); err != nil {
-				return "", fmt.Errorf("failed to write IV HMAC: %w", err)
+				return rollback(fmt.Errorf("failed to write IV HMAC: %w", err))
 			}
 			copy(iv, mac.Sum(nil))
 			cipher.NewCBCDecrypter(blk, iv).CryptBlocks(plaintext, buf)
 			plaintext = plaintext[:min(hdr.Datasize-bytesRead, uint64(hdr.Blocksize))]
 			if _, err := tmp.Write(plaintext); err != nil {
-				return "", fmt.Errorf("failed to write to decrypted DMG: %w", err)
+				return rollback(fmt.Errorf("failed to write to decrypted DMG: %w", err))
 			}
 			bytesRead += uint64(n)
 		}
 		if err == io.EOF {
 			break
 		} else if err != nil {
-			return "", fmt.Errorf("failed to read encrypted data: %w", err)
+			return rollback(fmt.Errorf("failed to read encrypted data: %w", err))
 		}
 	}
 
-	return tmp.Name(), nil
+	// The plaintext image is complete: close our descriptor and deliver the
+	// path. The caller now owns the temp file and must remove it.
+	if err := tmp.Close(); err != nil {
+		return rollback(fmt.Errorf("failed to close temp DMG file: %w", err))
+	}
+	return tmpPath, nil
 }

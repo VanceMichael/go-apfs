@@ -56,10 +56,11 @@ func completer(d prompt.Document) []prompt.Suggest {
 func Executor(s string) {
 	s = strings.TrimSpace(s)
 
-	if s == "" {
-		return
-	} else if s == "exit" {
-		os.Exit(0)
+	// "exit" only needs to be a no-op here: the prompt's ExitChecker makes
+	// Run return after this executor call, so control flows back through the
+	// command lifecycle and its defers (closing the DMG and removing the
+	// decrypted temp image) instead of being skipped by os.Exit.
+	if s == "" || s == "exit" {
 		return
 	}
 
@@ -169,7 +170,17 @@ var promptCmd = &cobra.Command{
 			a:   apfs,
 		}
 
-		p := prompt.New(Executor, completer, prompt.OptionLivePrefix(PromptPrefix))
+		p := prompt.New(
+			Executor,
+			completer,
+			prompt.OptionLivePrefix(PromptPrefix),
+			// "exit" followed by Enter runs Executor first and then ends the
+			// Run loop, returning here so defer dev.Close() still executes.
+			// A normal EOF (Ctrl-D on an empty line) ends Run the same way.
+			prompt.OptionSetExitCheckerOnInput(func(in string, breakline bool) bool {
+				return breakline && strings.TrimSpace(in) == "exit"
+			}),
+		)
 
 		p.Run()
 

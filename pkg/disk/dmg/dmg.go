@@ -573,46 +573,45 @@ func (b *Partition) decompressChunk(chunk udifBlockChunk) ([]byte, error) {
 }
 
 // Open opens the named file using os.Open and prepares it for use as a dmg.
+//
+// When a password or key is supplied, the matching decryption branch owns its
+// temp plaintext image until it has been fully written: any decryption error
+// closes and removes that temp file itself. Open only takes ownership of the
+// delivered temp image once stat, UDIF parsing and Load have all succeeded;
+// any earlier error closes the open descriptor and removes the decrypted
+// temp file (never the input image), while the original error is preserved
+// for the caller.
 func Open(name string, c *Config) (*DMG, error) {
 	var decrypted string
-	if len(c.Password) > 0 || len(c.Key) > 0 {
+	if c != nil && (len(c.Password) > 0 || len(c.Key) > 0) {
+		var err error
 		if len(c.Password) > 0 {
-			var err error
 			decrypted, err = DecryptDMGWithPassword(name, c.Password)
-			if err != nil {
-				return nil, err
-			}
-		} else if len(c.Key) > 0 {
-			var err error
+		} else {
 			decrypted, err = DecryptDMGWithKey(name, c.Key)
-			if err != nil {
-				return nil, err
-			}
+		}
+		if err != nil {
+			// The decryption branch has already rolled back its temp files.
+			return nil, err
 		}
 	}
-	var f *os.File
+
+	target := name
 	if len(decrypted) > 0 {
-		var err error
-		f, err = os.Open(decrypted)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		var err error
-		f, err = os.Open(name)
-		if err != nil {
-			return nil, err
-		}
+		target = decrypted
+	}
+	f, err := os.Open(target)
+	if err != nil {
+		// No descriptor was opened; drop the delivered decrypted artifact.
+		return nil, rollbackOpen(nil, decrypted, err)
 	}
 	fi, err := f.Stat()
 	if err != nil {
-		f.Close()
-		return nil, err
+		return nil, rollbackOpen(f, decrypted, err)
 	}
 	ff, err := NewDMG(io.NewSectionReader(f, 0, fi.Size()))
 	if err != nil {
-		f.Close()
-		return nil, err
+		return nil, rollbackOpen(f, decrypted, err)
 	}
 	if len(decrypted) > 0 {
 		ff.decrypted = decrypted
@@ -621,28 +620,60 @@ func Open(name string, c *Config) (*DMG, error) {
 		ff.config = *c
 	}
 	if err := ff.Load(); err != nil {
-		f.Close()
-		return nil, err
+		return nil, rollbackOpen(f, decrypted, err)
 	}
+	// All preparation succeeded: take ownership of the descriptor and the
+	// decrypted temp image. Close is now responsible for releasing both.
 	ff.closer = f
 	return ff, nil
 }
 
-// Close closes the DMG.
-// If the DMG was created using NewFile directly instead of Open,
-// Close has no effect.
+// rollbackOpen releases everything Open acquired before ownership transfer:
+// the open descriptor and the decrypted temp image. The input image is never
+// removed. cause stays the first error so callers keep diagnosing the
+// original stat/parse/Load failure via errors.Is/errors.As.
+func rollbackOpen(f *os.File, decrypted string, cause error) error {
+	var cleanup []error
+	if f != nil {
+		if err := f.Close(); err != nil {
+			cleanup = append(cleanup, fmt.Errorf("failed to close image descriptor: %w", err))
+		}
+	}
+	if decrypted != "" {
+		if err := os.Remove(decrypted); err != nil && !os.IsNotExist(err) {
+			cleanup = append(cleanup, fmt.Errorf("failed to remove decrypted temp image %s: %w", decrypted, err))
+		}
+	}
+	return errors.Join(append([]error{cause}, cleanup...)...)
+}
+
+// Close closes the DMG and removes any temp decrypted image.
+//
+// The descriptor close and the temp file removal are attempted independently:
+// a failure of one does not skip the other. Successfully released resources
+// are cleared while failed ones are remembered, so a repeated Close retries
+// only the outstanding cleanup instead of touching released resources again.
+// All errors from outstanding cleanup are joined and returned.
+// If the DMG was created using NewDMG directly instead of Open, Close has no
+// effect.
 func (d *DMG) Close() error {
-	var err error
+	var errs []error
 	if d.closer != nil {
-		err = d.closer.Close()
-		d.closer = nil
+		if err := d.closer.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close image descriptor: %w", err))
+		} else {
+			d.closer = nil
+		}
 	}
 	if d.decrypted != "" {
 		// remove temp decrypted file
-		err = os.Remove(d.decrypted)
-		d.decrypted = ""
+		if err := os.Remove(d.decrypted); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("failed to remove decrypted temp image %s: %w", d.decrypted, err))
+		} else {
+			d.decrypted = ""
+		}
 	}
-	return err
+	return errors.Join(errs...)
 }
 
 func (d *DMG) DecryptedTemp() string {

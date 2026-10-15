@@ -40,6 +40,11 @@ type APFS struct {
 }
 
 // Open opens the named file using os.Open and prepares it for use as an APFS.
+//
+// The device opened here is owned by Open: if initialization fails the device
+// is closed immediately, and on success the returned APFS takes ownership and
+// releases it via Close. A device passed straight to NewAPFS stays owned by
+// its caller; NewAPFS never closes it.
 func Open(name string) (*APFS, error) {
 	dev, err := disk.Open(name)
 	if err != nil {
@@ -47,21 +52,23 @@ func Open(name string) (*APFS, error) {
 	}
 	ff, err := NewAPFS(dev)
 	if err != nil {
+		_ = dev.Close()
 		return nil, err
 	}
+	ff.closer = dev
 	return ff, nil
 }
 
-// Close closes the APFS.
-// If the APFS was created using NewFile directly instead of Open,
-// Close has no effect.
+// Close closes the APFS, releasing the device opened by Open.
+// A device supplied directly to NewAPFS is caller-owned, so Close has no
+// effect for APFS values created that way.
 func (a *APFS) Close() error {
-	var err error
 	if a.closer != nil {
-		err = a.closer.Close()
+		err := a.closer.Close()
 		a.closer = nil
+		return err
 	}
-	return err
+	return nil
 }
 
 func init() {
