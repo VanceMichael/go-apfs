@@ -132,8 +132,10 @@ func GetDecmpfsHeader(ne NodeEntry) (*DecmpfsDiskHeader, error) {
 	return nil, fmt.Errorf("type is not APFS_TYPE_XATTR")
 }
 
-// DecompressFile decompresses decmpfs data
-func (h *DecmpfsDiskHeader) DecompressFile(r io.ReaderAt, decomp *bufio.Writer, fexts []FileExtent, nobar bool) (err error) {
+// DecompressFile decompresses decmpfs data. Resource-fork extents in fexts
+// are physical block numbers converted with geo, the geometry of the
+// container the file belongs to.
+func (h *DecmpfsDiskHeader) DecompressFile(r io.ReaderAt, geo Geometry, decomp *bufio.Writer, fexts []FileExtent, nobar bool) (err error) {
 
 	var max int
 	var buff []byte
@@ -142,7 +144,11 @@ func (h *DecmpfsDiskHeader) DecompressFile(r io.ReaderAt, decomp *bufio.Writer, 
 	var blocks []cmpfRsrcBlock
 
 	for _, fext := range fexts {
-		rr := io.NewSectionReader(r, int64(fext.Block*BLOCK_SIZE), int64(fext.Length))
+		off, err := geo.BlockOffset(fext.Block)
+		if err != nil {
+			return fmt.Errorf("failed to compute resource fork extent offset at block %#x: %v", fext.Block, err)
+		}
+		rr := io.NewSectionReader(r, off, int64(fext.Length))
 		if _, err := buf.ReadFrom(rr); err != nil {
 			return fmt.Errorf("failed to read from reader: %v", err)
 		}

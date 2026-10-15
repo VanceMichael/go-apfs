@@ -168,7 +168,20 @@ type BTreeNodePhys struct {
 	// Assumes the backing device is immutable.
 	nodeCache *lru.Cache[uint64, BTreeNodePhys]
 
+	// geo is the verified block geometry of the container this node was
+	// decoded from. It drives in-block value addressing and every child
+	// block read, so nodes decoded from different containers can never
+	// share a block size. Nodes assembled by hand (zero geo) use the
+	// 4 KiB default.
+	geo Geometry
+
 	block
+}
+
+// geometry returns the node's container geometry. The zero Geometry used by
+// nodes assembled by hand resolves to the 4 KiB default.
+func (n *BTreeNodePhys) geometry() Geometry {
+	return n.geo
 }
 
 func (n *BTreeNodePhys) IsRoot() bool {
@@ -219,7 +232,7 @@ func (n *BTreeNodePhys) ReadFextNodeEntry(r *bytes.Reader) error {
 	}
 
 	if valOffset != 0xFFFF {
-		r.Seek(int64(BLOCK_SIZE-uint64(valOffset)-40*uint64(n.Flags&1)), io.SeekStart) // val
+		r.Seek(int64(n.geometry().BlockSize())-int64(valOffset)-int64(40*uint64(n.Flags&1)), io.SeekStart) // val
 		if err := binary.Read(r, binary.LittleEndian, &fent.Val); err != nil {
 			return fmt.Errorf("failed to read %T: %v", fent.Val, err)
 		}
@@ -265,7 +278,7 @@ func (n *BTreeNodePhys) ReadSpacemanFreeQueueNodeEntry(r *bytes.Reader) error {
 	}
 
 	if valOffset != 0xFFFF {
-		r.Seek(int64(BLOCK_SIZE-uint64(valOffset)-40*uint64(n.Flags&1)), io.SeekStart) // val
+		r.Seek(int64(n.geometry().BlockSize())-int64(valOffset)-int64(40*uint64(n.Flags&1)), io.SeekStart) // val
 		if err := binary.Read(r, binary.LittleEndian, &sent.Val); err != nil {
 			return fmt.Errorf("failed to read %T: %v", sent.Val, err)
 		}
@@ -310,7 +323,7 @@ func (n *BTreeNodePhys) ReadOMapNodeEntry(r *bytes.Reader) error {
 		return fmt.Errorf("failed to read omap_key_t: %v", err)
 	}
 
-	r.Seek(int64(BLOCK_SIZE-uint64(valOffset)-40*uint64(n.Flags&1)), io.SeekStart) // val
+	r.Seek(int64(n.geometry().BlockSize())-int64(valOffset)-int64(40*uint64(n.Flags&1)), io.SeekStart) // val
 
 	if n.Level > 0 {
 		if err := binary.Read(r, binary.LittleEndian, &oent.PAddr); err != nil {
@@ -425,7 +438,7 @@ func (n *BTreeNodePhys) ReadNodeEntry(r *bytes.Reader) error {
 		return fmt.Errorf("got unsupported APFS type %s", nent.Hdr.GetType())
 	}
 
-	r.Seek(int64(BLOCK_SIZE-uint64(valOffset)-40*uint64(n.Flags&1)), io.SeekStart) // val
+	r.Seek(int64(n.geometry().BlockSize())-int64(valOffset)-int64(40*uint64(n.Flags&1)), io.SeekStart) // val
 
 	if n.Level > 0 {
 		switch nent.Hdr.GetType() {
@@ -868,14 +881,16 @@ func (n *BTreeNodePhys) ReadNodeEntry(r *bytes.Reader) error {
 }
 
 // readNodeCached returns the verified B-tree node at blockAddr, consulting
-// the node cache when one is enabled.
+// the node cache when one is enabled. The node is read with the geometry of
+// the container that owns this root, so cached traversals of concurrently
+// open containers never mix block sizes.
 func (n *BTreeNodePhys) readNodeCached(r io.ReaderAt, blockAddr uint64) (BTreeNodePhys, error) {
 	if n.nodeCache != nil {
 		if node, ok := n.nodeCache.Get(blockAddr); ok {
 			return node, nil
 		}
 	}
-	o, err := ReadObj(r, blockAddr)
+	o, err := ReadObjAt(r, blockAddr, n.geometry())
 	if err != nil {
 		return BTreeNodePhys{}, fmt.Errorf("failed to read B-tree node at %#x: %w", blockAddr, err)
 	}

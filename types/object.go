@@ -127,16 +127,69 @@ func (o Obj) String() string {
 	return fmt.Sprintf("%s cksum=%#x, oid=%#x, xid=%#x, sub_type=%s, flag=%s", o.Hdr.GetType(), o.Hdr.Checksum(), o.Hdr.Oid, o.Hdr.Xid, o.Hdr.GetSubType(), o.Hdr.GetFlag())
 }
 
-// ReadObj returns a verified object or error if block does not verify
+// ReadObj returns a verified object from an image that uses the default
+// 4 KiB block size. It is a convenience wrapper around ReadObjAt.
 func ReadObj(r io.ReaderAt, blockAddr uint64) (*Obj, error) {
+	return ReadObjAt(r, blockAddr, DefaultGeometry)
+}
+
+// PeekContainerGeometry recovers the block geometry declared by the container
+// superblock at block 0 without having assumed a block size yet. It reads only
+// the fixed first 4 KiB (NX_MINIMUM_BLOCK_SIZE) and therefore cannot verify
+// the block's checksum yet; the caller must re-read block 0 with ReadObjAt
+// using the returned geometry before trusting any of the block's contents.
+// The provisional 4 KiB read is never used as a fallback geometry.
+func PeekContainerGeometry(r io.ReaderAt) (Geometry, NxSuperblockT, error) {
+	var nxsb NxSuperblockT
+
+	block := make([]byte, NX_DEFAULT_BLOCK_SIZE)
+	if _, err := r.ReadAt(block, 0); err != nil {
+		return Geometry{}, nxsb, fmt.Errorf("failed to read container superblock probe at block 0: %v", err)
+	}
+
+	rr := bytes.NewReader(block)
+
+	var hdr ObjPhysT
+	if err := binary.Read(rr, binary.LittleEndian, &hdr); err != nil {
+		return Geometry{}, nxsb, fmt.Errorf("failed to read obj_phys_t: %v", err)
+	}
+	if hdr.GetType() != OBJECT_TYPE_NX_SUPERBLOCK {
+		return Geometry{}, nxsb, fmt.Errorf("object at block 0 is %s, not an nx_superblock_t", hdr.GetType())
+	}
+	if err := binary.Read(rr, binary.LittleEndian, &nxsb); err != nil {
+		return Geometry{}, nxsb, fmt.Errorf("failed to read APFS nx_superblock_t: %v", err)
+	}
+	if nxsb.Magic.String() != NX_MAGIC {
+		return Geometry{}, nxsb, fmt.Errorf("found unexpected nx_superblock_t magic: %s, expected: %s", nxsb.Magic.String(), NX_MAGIC)
+	}
+
+	geo, err := NewGeometry(nxsb.BlockSize)
+	if err != nil {
+		return Geometry{}, nxsb, fmt.Errorf("invalid nx_block_size %#x: %w", nxsb.BlockSize, err)
+	}
+
+	return geo, nxsb, nil
+}
+
+// ReadObjAt returns a verified object at blockAddr, converting the physical
+// block address with geo. Every object reached through recursion (object
+// maps, B-tree nodes, volume superblocks) is read with the same geometry, so
+// objects from one container can never be addressed with another
+// container's block size.
+func ReadObjAt(r io.ReaderAt, blockAddr uint64, geo Geometry) (*Obj, error) {
 
 	var err error
 	var o Obj
 
-	block := make([]byte, BLOCK_SIZE)
+	off, err := geo.BlockOffset(blockAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute object block address %#x: %v", blockAddr, err)
+	}
 
-	if _, err := r.ReadAt(block, int64(blockAddr*BLOCK_SIZE)); err != nil {
-		return nil, fmt.Errorf("failed to read object block data at block address %#x: %v", blockAddr, err)
+	block := make([]byte, geo.BlockSize())
+
+	if _, err := r.ReadAt(block, off); err != nil {
+		return nil, fmt.Errorf("failed to read object block data at block address %#x (offset %#x): %v", blockAddr, off, err)
 	}
 
 	if !VerifyChecksum(block) {
@@ -158,8 +211,11 @@ func ReadObj(r io.ReaderAt, blockAddr uint64) (*Obj, error) {
 		if nxsb.Magic.String() != NX_MAGIC {
 			return nil, fmt.Errorf("found unexpected nx_superblock_t magic: %s, expected: %s", nxsb.Magic.String(), NX_MAGIC)
 		}
+		if nxsb.BlockSize != uint32(geo.BlockSize()) {
+			return nil, fmt.Errorf("nx_superblock_t at block %#x declares block size %#x but is being read with block size %#x", blockAddr, nxsb.BlockSize, geo.BlockSize())
+		}
 		if nxsb.OmapOid > 0 {
-			nxsb.OMap, err = ReadObj(r, uint64(nxsb.OmapOid))
+			nxsb.OMap, err = ReadObjAt(r, uint64(nxsb.OmapOid), geo)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read nx_superblock_t omap at block %#x: %v", nxsb.OmapOid, err)
 			}
@@ -172,6 +228,9 @@ func ReadObj(r io.ReaderAt, blockAddr uint64) (*Obj, error) {
 		if err := binary.Read(rr, binary.LittleEndian, &node.BTreeNodePhysT); err != nil {
 			return nil, fmt.Errorf("failed to read btree_node_phys_t struct: %v", err)
 		}
+		// The node's in-block key/value addressing and every child node it
+		// resolves must use the geometry of the container it belongs to.
+		node.geo = geo
 		if node.Nkeys > 0 {
 			switch o.Hdr.GetSubType() {
 			case OBJECT_TYPE_OMAP:
@@ -181,7 +240,7 @@ func ReadObj(r io.ReaderAt, blockAddr uint64) (*Obj, error) {
 						return nil, fmt.Errorf("failed to read omap node entry: %v", err)
 					}
 					// if oent, ok := node.Entries[i].(OMapNodeEntry); ok {
-					// 	oent.OMap, err = ReadObj(r, uint64(node.Entries[i].(OMapNodeEntry).Val.Paddr))
+					// 	oent.OMap, err = ReadObjAt(r, uint64(node.Entries[i].(OMapNodeEntry).Val.Paddr), geo)
 					// 	if err != nil {
 					// 		return nil, fmt.Errorf("failed to read omap node entry omap")
 					// 	}
@@ -249,13 +308,13 @@ func ReadObj(r io.ReaderAt, blockAddr uint64) (*Obj, error) {
 			return nil, fmt.Errorf("failed to read omap_phys_t: %v", err)
 		}
 		if omap.TreeOid > 0 {
-			omap.Tree, err = ReadObj(r, uint64(omap.TreeOid))
+			omap.Tree, err = ReadObjAt(r, uint64(omap.TreeOid), geo)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read omap_phys_t tree at block %#x: %v", omap.TreeOid, err)
 			}
 		}
 		if omap.SnapshotTreeOid > 0 {
-			omap.Tree, err = ReadObj(r, uint64(omap.SnapshotTreeOid))
+			omap.Tree, err = ReadObjAt(r, uint64(omap.SnapshotTreeOid), geo)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read omap_phys_t snapshot_tree at block %#x: %v", omap.SnapshotTreeOid, err)
 			}
@@ -280,19 +339,19 @@ func ReadObj(r io.ReaderAt, blockAddr uint64) (*Obj, error) {
 			return nil, fmt.Errorf("found unexpected apfs_superblock_t magic: %s, expected: %s", apsb.Magic.String(), APFS_MAGIC)
 		}
 		if apsb.OmapOid > 0 {
-			apsb.OMap, err = ReadObj(r, uint64(apsb.OmapOid))
+			apsb.OMap, err = ReadObjAt(r, uint64(apsb.OmapOid), geo)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read root node of the container object map B-tree at block %#x: %v", apsb.OmapOid, err)
 			}
 		}
 		if apsb.ExtentrefTreeOid > 0 {
-			apsb.ExtentRefTree, err = ReadObj(r, uint64(apsb.ExtentrefTreeOid))
+			apsb.ExtentRefTree, err = ReadObjAt(r, uint64(apsb.ExtentrefTreeOid), geo)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read root node of the container object map B-tree at block %#x: %v", apsb.ExtentrefTreeOid, err)
 			}
 		}
 		if apsb.SnapMetaTreeOid > 0 {
-			apsb.SnapMetaTree, err = ReadObj(r, uint64(apsb.SnapMetaTreeOid))
+			apsb.SnapMetaTree, err = ReadObjAt(r, uint64(apsb.SnapMetaTreeOid), geo)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read root node of the container object map B-tree at block %#x: %v", apsb.SnapMetaTreeOid, err)
 			}

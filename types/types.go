@@ -9,8 +9,6 @@ import (
 
 const FSROOT_OID = 2
 
-var BLOCK_SIZE uint64
-
 type paddr_t int64
 
 type prange struct {
@@ -131,18 +129,24 @@ func CreateChecksum(data []byte) uint64 {
 	return (check2 << 32) | check1
 }
 
+// VerifyChecksum reports whether the block's stored Fletcher-64 checksum is
+// consistent with its contents. The stored checksum (the first eight bytes)
+// is produced by CreateChecksum over a block whose checksum field has been
+// zeroed, so verification recomputes it the same way and compares it to the
+// stored value instead of folding the checksum words into the running total
+// (their position-dependent contribution to the second accumulator does not
+// cancel on genuine Apple images).
 func VerifyChecksum(data []byte) bool {
-	var sum1, sum2 uint64
-
-	modValue := uint64(2<<31 - 1)
-
-	for i := range len(data) / 4 {
-		d := binary.LittleEndian.Uint32(data[i*4 : (i+1)*4])
-		sum1 = (sum1 + uint64(d)) % modValue
-		sum2 = (sum2 + sum1) % modValue
+	if len(data) < MAX_CKSUM_SIZE {
+		return false
 	}
-
-	return (sum2<<32)|sum1 != 0
+	stored := binary.LittleEndian.Uint64(data[:MAX_CKSUM_SIZE])
+	buf := make([]byte, len(data))
+	copy(buf, data)
+	for i := range MAX_CKSUM_SIZE {
+		buf[i] = 0
+	}
+	return CreateChecksum(buf) == stored
 }
 
 var NameColor = color.New(color.Bold, color.FgHiBlue).SprintFunc()

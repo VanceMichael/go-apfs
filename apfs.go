@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/apex/log"
 	"github.com/blacktop/go-apfs/pkg/disk"
@@ -34,9 +36,22 @@ type APFS struct {
 	volume          *types.Obj
 	fsOMapBtree     *types.BTreeNodePhys
 
-	dev    disk.Device
-	r      io.ReaderAt
-	closer io.Closer
+	dev disk.Device
+	r   io.ReaderAt
+
+	// geo is the verified physical block geometry of this container. It is
+	// established before the mount becomes visible and never changes: every
+	// block-address conversion in this instance uses it. Instances never
+	// share geometry, so mounting a container with another block size cannot
+	// affect this one.
+	geo types.Geometry
+
+	// closer is owned by Open only; containers built with NewAPFS leave it
+	// nil because the caller owns the device. closeOnce makes Close safe to
+	// call concurrently and repeatedly.
+	closer    io.Closer
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // Open opens the named file using os.Open and prepares it for use as an APFS.
@@ -47,29 +62,33 @@ func Open(name string) (*APFS, error) {
 	}
 	ff, err := NewAPFS(dev)
 	if err != nil {
+		// NewAPFS never closes a device it did not open; the failed mount
+		// must not leak the file descriptor.
+		_ = dev.Close()
 		return nil, err
 	}
+	ff.closer = dev
 	return ff, nil
 }
 
-// Close closes the APFS.
-// If the APFS was created using NewFile directly instead of Open,
-// Close has no effect.
+// Close closes the APFS device when the APFS was created with Open. APFS
+// objects built directly with NewAPFS are not closed here because the caller
+// owns the device. Close is idempotent and safe for concurrent use: exactly
+// one close is performed and every caller receives the same result.
 func (a *APFS) Close() error {
-	var err error
-	if a.closer != nil {
-		err = a.closer.Close()
-		a.closer = nil
-	}
-	return err
-}
-
-func init() {
-	types.BLOCK_SIZE = types.NX_DEFAULT_BLOCK_SIZE
+	a.closeOnce.Do(func() {
+		if a.closer != nil {
+			a.closeErr = a.closer.Close()
+		}
+	})
+	return a.closeErr
 }
 
 // NewAPFS creates a new APFS for accessing a apple filesystem container or file in an underlying reader.
 // The apfs is expected to start at position 0 in the ReaderAt.
+//
+// The device is not closed on failure (or by Close); its lifetime is the
+// caller's responsibility.
 func NewAPFS(dev disk.Device) (*APFS, error) {
 
 	var err error
@@ -78,28 +97,58 @@ func NewAPFS(dev disk.Device) (*APFS, error) {
 	a.dev = dev
 	a.r = dev
 
-	a.nxsb, err = types.ReadObj(a.r, 0)
+	// Phase 1 — bootstrap. The container block size is a field of the
+	// superblock at block 0, so it has to be recovered with a fixed 4 KiB
+	// provisional read before the real geometry is known. This probe neither
+	// verifies a checksum nor becomes the mount's geometry: it only extracts
+	// the declared size.
+	geo, boot, err := types.PeekContainerGeometry(a.r)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read APFS container: %w", err)
 	}
+
+	// Reject geometric declarations that cannot fit the backing device
+	// before any object is trusted or any mount state becomes visible.
+	bs := geo.BlockSize()
+	if devSize := dev.GetSize(); devSize > 0 {
+		if bs > devSize {
+			return nil, fmt.Errorf("declared block size %#x does not fit in a %#x byte device", bs, devSize)
+		}
+		if boot.BlockCount != 0 {
+			hi, total := bits.Mul64(boot.BlockCount, bs)
+			if hi != 0 || total > devSize {
+				return nil, fmt.Errorf("declared container geometry %d blocks of %#x bytes exceeds device size %#x", boot.BlockCount, bs, devSize)
+			}
+		}
+	}
+
+	// Phase 2 — authoritative read of block 0 with the declared geometry.
+	// The block checksum is verified over the whole block and its declared
+	// block size must match the geometry; an inconsistent declaration fails
+	// here instead of silently falling back to 4 KiB.
+	a.nxsb, err = types.ReadObjAt(a.r, 0, geo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read APFS container: %w", err)
+	}
+	a.geo = geo
 
 	if nxsb, ok := a.nxsb.Body.(types.NxSuperblock); ok {
 		a.Container = &nxsb
 	}
 
-	if a.Container.BlockSize != types.NX_DEFAULT_BLOCK_SIZE {
-		types.BLOCK_SIZE = uint64(a.Container.BlockSize)
-		log.Warnf("found non-standard blocksize in APFS nx_superblock_t: %#x", types.BLOCK_SIZE)
+	if bs != types.NX_DEFAULT_BLOCK_SIZE {
+		log.Warnf("found non-standard blocksize in APFS nx_superblock_t: %#x", bs)
 	}
 
 	log.WithFields(log.Fields{
-		"checksum": fmt.Sprintf("%#x", a.nxsb.Hdr.Checksum()),
-		"oid":      fmt.Sprintf("%#x", a.nxsb.Hdr.Oid),
-		"xid":      fmt.Sprintf("%#x", a.nxsb.Hdr.Xid),
-		"type":     a.nxsb.Hdr.GetType(),
-		"sub_type": a.nxsb.Hdr.GetSubType(),
-		"flag":     a.nxsb.Hdr.GetFlag(),
-		"magic":    a.Container.Magic.String(),
+		"checksum":   fmt.Sprintf("%#x", a.nxsb.Hdr.Checksum()),
+		"oid":        fmt.Sprintf("%#x", a.nxsb.Hdr.Oid),
+		"xid":        fmt.Sprintf("%#x", a.nxsb.Hdr.Xid),
+		"type":       a.nxsb.Hdr.GetType(),
+		"sub_type":   a.nxsb.Hdr.GetSubType(),
+		"flag":       a.nxsb.Hdr.GetFlag(),
+		"magic":      a.Container.Magic.String(),
+		"block_size": fmt.Sprintf("%#x", bs),
 	}).Debug("APFS Container")
 
 	log.WithFields(log.Fields{
@@ -118,7 +167,7 @@ func NewAPFS(dev disk.Device) (*APFS, error) {
 
 	if len(a.Valid.OMap.Body.(types.OMap).Tree.Body.(types.BTreeNodePhys).Entries) == 1 { // TODO: could be more than 1 for non IPSW APFS volumes?
 		if entry, ok := a.Valid.OMap.Body.(types.OMap).Tree.Body.(types.BTreeNodePhys).Entries[0].(types.OMapNodeEntry); ok {
-			a.volume, err = types.ReadObj(a.r, uint64(entry.Val.Paddr))
+			a.volume, err = types.ReadObjAt(a.r, uint64(entry.Val.Paddr), a.geo)
 			if err != nil {
 				return nil, fmt.Errorf("failed to read APFS omap.tree.entry.omap (volume): %v", err)
 			}
@@ -153,7 +202,7 @@ func NewAPFS(dev disk.Device) (*APFS, error) {
 
 	log.Debugf("File System Root Entry: %s", fsRootEntry)
 
-	fsRootBtreeObj, err := types.ReadObj(a.r, fsRootEntry.Val.Paddr)
+	fsRootBtreeObj, err := types.ReadObjAt(a.r, fsRootEntry.Val.Paddr, a.geo)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read root btree: %v", err)
 	}
@@ -174,9 +223,23 @@ func (a *APFS) getValidCSB() error {
 		return fmt.Errorf("unable to parse non-contiguous checkpoint descriptor area")
 	}
 	xpDescBlocks := nxsb.XpDescBlocks & ^(uint32(1) << 31)
+	if xpDescBlocks == 0 {
+		return fmt.Errorf("container superblock declares an empty checkpoint descriptor area")
+	}
+
+	// Every checkpoint descriptor block must lie inside the declared
+	// container; an out-of-bounds base or length is rejected outright.
+	if nxsb.BlockCount != 0 {
+		if uint64(nxsb.XpDescBase) >= nxsb.BlockCount {
+			return fmt.Errorf("checkpoint descriptor base block %#x is outside the container (%d blocks)", nxsb.XpDescBase, nxsb.BlockCount)
+		}
+		if uint64(xpDescBlocks) > nxsb.BlockCount-uint64(nxsb.XpDescBase) {
+			return fmt.Errorf("checkpoint descriptor area of %d blocks at block %#x runs past the container (%d blocks)", xpDescBlocks, nxsb.XpDescBase, nxsb.BlockCount)
+		}
+	}
 
 	for i := range xpDescBlocks {
-		o, err := types.ReadObj(a.r, nxsb.XpDescBase+uint64(i))
+		o, err := types.ReadObjAt(a.r, nxsb.XpDescBase+uint64(i), a.geo)
 		if err != nil {
 			if errors.Is(err, types.ErrBadBlockChecksum) {
 				log.Debug(fmt.Sprintf("checkpoint block at index %d failed checksum validation. Skipping...", i))
@@ -187,11 +250,25 @@ func (a *APFS) getValidCSB() error {
 		a.checkPointDesc = append(a.checkPointDesc, o)
 	}
 
+	if len(a.checkPointDesc) == 0 {
+		return fmt.Errorf("no checkpoint descriptor block passed verification")
+	}
+
 	a.validCheckPoint = a.checkPointDesc[len(a.checkPointDesc)-1]
 
-	if nxsb, ok := a.validCheckPoint.Body.(types.NxSuperblock); ok {
-		a.Valid = &nxsb
+	cp, ok := a.validCheckPoint.Body.(types.NxSuperblock)
+	if !ok {
+		return fmt.Errorf("last checkpoint descriptor block is %s, not an nx_superblock_t", a.validCheckPoint.Hdr.GetType())
 	}
+
+	// The checkpointed geometry must agree with the geometry verified from
+	// block 0; otherwise block addresses derived later in the mount would be
+	// ambiguous.
+	if cp.BlockSize != uint32(a.geo.BlockSize()) {
+		return fmt.Errorf("checkpoint superblock declares block size %#x, which disagrees with block 0 block size %#x", cp.BlockSize, a.geo.BlockSize())
+	}
+
+	a.Valid = &cp
 
 	if a.Valid.XpDescIndex+a.Valid.XpDescLen <= xpDescBlocks { // TODO: remove this
 		log.Debug("contiguous")
@@ -325,13 +402,17 @@ func (a *APFS) Cat(path string) error {
 
 		if compressed {
 			w := bufio.NewWriter(os.Stdout)
-			if err := decmpfsHdr.DecompressFile(a.r, w, fexts, true); err != nil {
+			if err := decmpfsHdr.DecompressFile(a.r, a.geo, w, fexts, true); err != nil {
 				return fmt.Errorf("failed to decompress %s: %v", fileName, err)
 			}
 			w.Flush()
 		} else {
 			for _, fext := range fexts {
-				if err := a.dev.ReadFile(bufio.NewWriter(os.Stdout), int64(fext.Block*types.BLOCK_SIZE), int64(totalBytesWritten)); err != nil {
+				off, err := a.geo.BlockOffset(fext.Block)
+				if err != nil {
+					return fmt.Errorf("failed to compute file extent offset at block %#x: %v", fext.Block, err)
+				}
+				if err := a.dev.ReadFile(bufio.NewWriter(os.Stdout), off, int64(totalBytesWritten)); err != nil {
 					return fmt.Errorf("failed to write file data from device: %v", err)
 				}
 			}
@@ -648,7 +729,7 @@ func (a *APFS) copyFile(root *os.Root, rec types.NodeEntry, dest string) error {
 	}
 	w := bufio.NewWriter(fo)
 	if compressed {
-		if err := decmpfsHdr.DecompressFile(a.r, w, fexts, false); err != nil {
+		if err := decmpfsHdr.DecompressFile(a.r, a.geo, w, fexts, false); err != nil {
 			return fmt.Errorf("failed to decompress and write %s: %v", outPath, err)
 		}
 		expectedSize = uncompressedSize
@@ -659,7 +740,11 @@ func (a *APFS) copyFile(root *os.Root, rec types.NodeEntry, dest string) error {
 				break
 			}
 			extentBytes := min(int64(fext.Length), remaining)
-			if err := a.dev.ReadFile(w, int64(fext.Block*types.BLOCK_SIZE), extentBytes); err != nil {
+			off, err := a.geo.BlockOffset(fext.Block)
+			if err != nil {
+				return fmt.Errorf("failed to compute file extent offset at block %#x: %v", fext.Block, err)
+			}
+			if err := a.dev.ReadFile(w, off, extentBytes); err != nil {
 				return fmt.Errorf("failed to write file data from device: %v", err)
 			}
 			remaining -= extentBytes
