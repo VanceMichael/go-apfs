@@ -22,21 +22,18 @@ THE SOFTWARE.
 package cmd
 
 import (
-	"path/filepath"
-
 	"github.com/apex/log"
-	"github.com/blacktop/go-apfs"
-	"github.com/blacktop/go-apfs/pkg/disk/dmg"
 	"github.com/spf13/cobra"
 )
 
 func init() {
 	rootCmd.AddCommand(catCmd)
+	addVolumeFlag(catCmd)
 }
 
 // catCmd represents the cat command
 var catCmd = &cobra.Command{
-	Use:   "cat",
+	Use:   "cat <DMG> <FILE>...",
 	Short: "🚧 cat(1) file in APFS container",
 	Args:  cobra.MinimumNArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -45,18 +42,12 @@ var catCmd = &cobra.Command{
 			log.SetLevel(log.DebugLevel)
 		}
 
-		dmgPath := filepath.Clean(args[0])
-
-		dev, err := dmg.Open(dmgPath, nil)
+		a, dev, err := openAPFS(cmd, args[0], nil)
 		if err != nil {
 			return err
 		}
+		defer a.Close()
 		defer dev.Close()
-
-		a, err := apfs.NewAPFS(dev)
-		if err != nil {
-			return err
-		}
 
 		for i := 1; i < len(args); i++ {
 			if err := a.Cat(args[i]); err != nil {

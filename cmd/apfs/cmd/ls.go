@@ -22,17 +22,13 @@ THE SOFTWARE.
 package cmd
 
 import (
-	"path/filepath"
-
 	"github.com/apex/log"
-	"github.com/blacktop/go-apfs"
-	"github.com/blacktop/go-apfs/pkg/disk/dmg"
 	"github.com/spf13/cobra"
 )
 
 // lsCmd represents the ls command
 var lsCmd = &cobra.Command{
-	Use:   "ls",
+	Use:   "ls <DMG> [PATH]",
 	Short: "🚧 List files in APFS container",
 	Args:  cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -41,18 +37,12 @@ var lsCmd = &cobra.Command{
 			log.SetLevel(log.DebugLevel)
 		}
 
-		dmgPath := filepath.Clean(args[0])
-
-		dev, err := dmg.Open(dmgPath, nil)
+		a, dev, err := openAPFS(cmd, args[0], nil)
 		if err != nil {
 			return err
 		}
+		defer a.Close()
 		defer dev.Close()
-
-		a, err := apfs.NewAPFS(dev)
-		if err != nil {
-			return err
-		}
 
 		if len(args) > 1 {
 			if err := a.List(args[1]); err != nil {
@@ -69,4 +59,5 @@ var lsCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(lsCmd)
+	addVolumeFlag(lsCmd)
 }

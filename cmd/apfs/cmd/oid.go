@@ -22,13 +22,10 @@ THE SOFTWARE.
 package cmd
 
 import (
-	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/apex/log"
-	"github.com/blacktop/go-apfs"
-	"github.com/blacktop/go-apfs/pkg/disk/dmg"
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 )
@@ -50,7 +47,7 @@ func ConvertStrToInt(intStr string) (uint64, error) {
 
 // oidCmd represents the oid command
 var oidCmd = &cobra.Command{
-	Use:   "oid",
+	Use:   "oid <DMG> <OID>",
 	Short: "🚧 Show Oid Info",
 	Args:  cobra.MinimumNArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -61,18 +58,12 @@ var oidCmd = &cobra.Command{
 
 		color.NoColor = !cmd.Flag("color").Changed
 
-		dmgPath := filepath.Clean(args[0])
-
-		dev, err := dmg.Open(dmgPath, nil)
+		a, dev, err := openAPFS(cmd, args[0], nil)
 		if err != nil {
 			return err
 		}
+		defer a.Close()
 		defer dev.Close()
-
-		a, err := apfs.NewAPFS(dev)
-		if err != nil {
-			return err
-		}
 
 		oid, err := ConvertStrToInt(args[1])
 		if err != nil {
@@ -90,4 +81,5 @@ var oidCmd = &cobra.Command{
 func init() {
 	rootCmd.AddCommand(oidCmd)
 	oidCmd.Flags().Bool("color", false, "Force color output")
+	addVolumeFlag(oidCmd)
 }

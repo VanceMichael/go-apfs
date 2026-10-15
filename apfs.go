@@ -34,6 +34,11 @@ type APFS struct {
 	volume          *types.Obj
 	fsOMapBtree     *types.BTreeNodePhys
 
+	// volumes is the stable enumeration of the valid checkpoint; selected is
+	// the currently active volume, or nil when none is selected.
+	volumes  []Volume
+	selected *Volume
+
 	dev    disk.Device
 	r      io.ReaderAt
 	closer io.Closer
@@ -116,50 +121,16 @@ func NewAPFS(dev disk.Device) (*APFS, error) {
 		return nil, fmt.Errorf("failed to find the container superblock that has the largest transaction identifier and isnʼt malformed: %v", err)
 	}
 
-	if len(a.Valid.OMap.Body.(types.OMap).Tree.Body.(types.BTreeNodePhys).Entries) == 1 { // TODO: could be more than 1 for non IPSW APFS volumes?
-		if entry, ok := a.Valid.OMap.Body.(types.OMap).Tree.Body.(types.BTreeNodePhys).Entries[0].(types.OMapNodeEntry); ok {
-			a.volume, err = types.ReadObj(a.r, uint64(entry.Val.Paddr))
-			if err != nil {
-				return nil, fmt.Errorf("failed to read APFS omap.tree.entry.omap (volume): %v", err)
-			}
-			if vol, ok := a.volume.Body.(types.ApfsSuperblock); ok {
-				log.WithFields(log.Fields{
-					"checksum": fmt.Sprintf("%#x", a.volume.Hdr.Checksum()),
-					"type":     a.volume.Hdr.GetType(),
-					"oid":      fmt.Sprintf("%#x", a.volume.Hdr.Oid),
-					"xid":      fmt.Sprintf("%#x", a.volume.Hdr.Xid),
-					"sub_type": a.volume.Hdr.GetSubType(),
-					"flag":     a.volume.Hdr.GetFlag(),
-				}).Debug(fmt.Sprintf("APFS Volume (%s)", string(vol.VolumeName[:])))
-
-				a.Volume = &vol
-			}
-		}
+	log.Debug("Enumerating APFS volumes in the valid checkpoint")
+	if err := a.discoverVolumes(); err != nil {
+		return nil, fmt.Errorf("failed to enumerate APFS volumes: %v", err)
 	}
-
-	log.Debugf("File System OMap Btree: %s", a.Volume.OMap.Body.(types.OMap).Tree)
-
-	if ombtree, ok := a.Volume.OMap.Body.(types.OMap).Tree.Body.(types.BTreeNodePhys); ok {
-		a.fsOMapBtree = &ombtree
-		if err := a.fsOMapBtree.EnableNodeCache(fsNodeCacheSize); err != nil {
-			return nil, fmt.Errorf("failed to enable fs omap node cache: %w", err)
-		}
-	}
-
-	fsRootEntry, err := a.fsOMapBtree.GetOMapEntry(a.r, a.Volume.RootTreeOid, a.volume.Hdr.Xid)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get root entry: %v", err)
-	}
-
-	log.Debugf("File System Root Entry: %s", fsRootEntry)
-
-	fsRootBtreeObj, err := types.ReadObj(a.r, fsRootEntry.Val.Paddr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read root btree: %v", err)
-	}
-
-	if root, ok := fsRootBtreeObj.Body.(types.BTreeNodePhys); ok {
-		a.FSRootBtree = root
+	// A single mountable volume is auto-selected, preserving the historical
+	// default. With several volumes nothing is guessed from the object map:
+	// callers select explicitly and operations until then return a
+	// NoVolumeSelectedError listing the available identities.
+	if err := a.autoSelectVolume(); err != nil {
+		return nil, err
 	}
 
 	return a, nil
@@ -204,6 +175,10 @@ func (a *APFS) getValidCSB() error {
 
 func (a *APFS) OidInfo(oid uint64) error {
 
+	if err := a.requireVolume(); err != nil {
+		return err
+	}
+
 	sr := a.r
 
 	fsRecords, err := a.fsOMapBtree.GetFSRecordsForOid(sr, a.FSRootBtree, types.OidT(oid), types.XidT(^uint64(0)))
@@ -246,6 +221,10 @@ func (a *APFS) OidInfo(oid uint64) error {
 func (a *APFS) Cat(path string) error {
 	var fsRecords types.FSRecords
 	var decmpfsHdr *types.DecmpfsDiskHeader
+
+	if err := a.requireVolume(); err != nil {
+		return err
+	}
 
 	sr := a.r
 
@@ -343,6 +322,10 @@ func (a *APFS) Cat(path string) error {
 
 // List lists files at a given path
 func (a *APFS) List(path string) error {
+
+	if err := a.requireVolume(); err != nil {
+		return err
+	}
 
 	sr := a.r
 
@@ -445,6 +428,10 @@ func (a *APFS) List(path string) error {
 // Tree list contents of directories in a tree-like format. TODO: finish this
 func (a *APFS) Tree(path string) error {
 
+	if err := a.requireVolume(); err != nil {
+		return err
+	}
+
 	sr := a.r
 
 	fsRecords, err := a.fsOMapBtree.GetFSRecordsForOid(sr, a.FSRootBtree, types.OidT(types.FSROOT_OID), types.XidT(^uint64(0)))
@@ -482,6 +469,9 @@ func (a *APFS) Tree(path string) error {
 
 // Copy copies the contents of the src file to the dest file TODO: finish this
 func (a *APFS) Copy(src, dest string) (err error) {
+	if err := a.requireVolume(); err != nil {
+		return err
+	}
 	entries, err := a.find(src)
 	if err != nil {
 		return fmt.Errorf("failed to find %s: %v", src, err)

@@ -49,6 +49,8 @@ func completer(d prompt.Document) []prompt.Suggest {
 		{Text: "exit", Description: "Quit prompt"},
 		{Text: "ls", Description: "List files"},
 		{Text: "pwd", Description: "Print working directory name"},
+		{Text: "volume", Description: "Select a volume (index, name, uuid or role)"},
+		{Text: "volumes", Description: "List the container's volumes"},
 	}
 	return prompt.FilterHasPrefix(s, d.TextBeforeCursor(), true)
 }
@@ -76,6 +78,21 @@ func Executor(s string) {
 	}
 
 	switch args[0] {
+	case "volumes":
+		printVolumes(os.Stdout, pctx.a)
+	case "volume":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: volume <index|name|uuid|role> (prefix with index:/name:/uuid:/role: to force)")
+			printVolumes(os.Stdout, pctx.a)
+			return
+		}
+		if err := pctx.a.SelectVolume(strings.Join(args[1:], " ")); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err.Error())
+			return
+		}
+		selected := pctx.a.SelectedVolume()
+		fmt.Fprintf(os.Stdout, "selected volume %d: %s (%s, %s)\n", selected.Index, selected.Name, selected.UUID, selected.Role)
+		pctx.pwd = "/"
 	case "cd":
 		if len(args) == 1 {
 			pctx.pwd = "/"
@@ -138,12 +155,19 @@ func Executor(s string) {
 }
 
 func PromptPrefix() (string, bool) {
-	return pctx.pwd + " > ", true
+	volume := "<no volume>"
+	if v := pctx.a.SelectedVolume(); v != nil {
+		volume = v.Name
+		if volume == "" {
+			volume = v.Role.String()
+		}
+	}
+	return fmt.Sprintf("[%s] %s > ", volume, pctx.pwd), true
 }
 
 // promptCmd represents the prompt command
 var promptCmd = &cobra.Command{
-	Use:   "prompt",
+	Use:   "prompt <DMG>",
 	Short: "🚧 prompt to interactively run multiple commands",
 	Args:  cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -151,22 +175,23 @@ var promptCmd = &cobra.Command{
 			log.SetLevel(log.DebugLevel)
 		}
 
-		dmgPath := filepath.Clean(args[0])
-
-		dev, err := dmg.Open(dmgPath, &dmg.Config{DisableCache: true})
+		a, dev, err := openAPFS(cmd, args[0], &dmg.Config{DisableCache: true})
 		if err != nil {
 			return err
 		}
+		defer a.Close()
 		defer dev.Close()
-
-		apfs, err := apfs.NewAPFS(dev)
-		if err != nil {
-			return err
-		}
 
 		pctx = &promptContext{
 			pwd: "/",
-			a:   apfs,
+			a:   a,
+		}
+
+		if a.SelectedVolume() == nil {
+			// Multi-volume container without a --volume selector: show the
+			// available identities instead of guessing or panicking.
+			fmt.Fprintln(os.Stderr, "This container has multiple volumes; select one with: volume <index|name|uuid|role>")
+			printVolumes(os.Stderr, a)
 		}
 
 		p := prompt.New(Executor, completer, prompt.OptionLivePrefix(PromptPrefix))
@@ -179,4 +204,5 @@ var promptCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(promptCmd)
+	addVolumeFlag(promptCmd)
 }

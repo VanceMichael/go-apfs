@@ -889,6 +889,11 @@ func (n *BTreeNodePhys) readNodeCached(r io.ReaderAt, blockAddr uint64) (BTreeNo
 	return node, nil
 }
 
+// NodeCacheEnabled reports whether a decoded-node cache is attached.
+func (n *BTreeNodePhys) NodeCacheEnabled() bool {
+	return n.nodeCache != nil
+}
+
 // EnableNodeCache attaches a bounded LRU cache of decoded B-tree nodes keyed by
 // physical block address to this node. GetFSRecordsForOid and GetOMapEntry
 // consult it on every level of their traversal. Call it once on the FS omap

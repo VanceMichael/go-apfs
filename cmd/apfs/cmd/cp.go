@@ -23,10 +23,8 @@ package cmd
 
 import (
 	"os"
-	"path/filepath"
 
 	"github.com/apex/log"
-	"github.com/blacktop/go-apfs"
 	"github.com/blacktop/go-apfs/pkg/disk/dmg"
 	"github.com/spf13/cobra"
 )
@@ -42,18 +40,12 @@ var cpCmd = &cobra.Command{
 			log.SetLevel(log.DebugLevel)
 		}
 
-		dmgPath := filepath.Clean(args[0])
-
-		dev, err := dmg.Open(dmgPath, &dmg.Config{DisableCache: true})
+		a, dev, err := openAPFS(cmd, args[0], &dmg.Config{DisableCache: true})
 		if err != nil {
 			return err
 		}
+		defer a.Close()
 		defer dev.Close()
-
-		a, err := apfs.NewAPFS(dev)
-		if err != nil {
-			return err
-		}
 
 		if len(args) > 2 {
 			if err := a.Copy(args[1], args[2]); err != nil {
@@ -75,4 +67,5 @@ var cpCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(cpCmd)
+	addVolumeFlag(cpCmd)
 }
